@@ -1,4 +1,4 @@
-# saws
+# saws (super AWS)
 `saws` is a command-line tool written in Go designed to simplify interactions with multiple AWS accounts and roles. It allows you to:
 
 1.  **Execute AWS CLI commands** concurrently across multiple AWS accounts and regions after assuming a specified IAM role.
