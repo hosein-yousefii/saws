@@ -110,3 +110,108 @@ roles:
   ReadOnly: "ViewOnlyAccessRole"
   PowerUser: "PowerUserAccessRole"
   InfraAdmin: "InfrastructureAdministratorRole"
+```
+### Initial AWS Credentials
+
+`saws` itself needs AWS credentials to make the initial `sts:AssumeRole` call. It uses the standard AWS SDK credential chain, looking for credentials associated with the `baseProfileForAssume` (which defaults to `"default"`). Ensure you have credentials configured for this profile, typically via:
+
+* `~/.aws/credentials` file
+* `~/.aws/config` file (if using profiles)
+* Environment Variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`)
+* IAM Role attached to an EC2 instance or ECS task.
+
+The user or role associated with these initial credentials must have `sts:AssumeRole` permission for the target roles you intend to assume in the other accounts.
+
+## Usage
+
+`saws` operates in two main modes: Command Execution and Environment Setup.
+
+### Command Execution Mode
+
+This mode assumes a role in the target accounts/regions and executes a specified AWS CLI command.
+
+**Syntax:**
+
+```bash
+saws -r <role_name> -c "<aws_command>" [-a | -s <selector>] [-regions <region1,...>] [-config <path>]
+```
+## Required Flags:
+
+* `-r <role_name>`: The exact name of the IAM Role to assume in the target accounts.
+* `-c "<aws_command>"`: The AWS CLI command to execute (enclose in quotes if it contains spaces).
+
+**One of the following is also required:**
+
+* `-a`: Execute the command in **ALL** accounts listed in `saws-config.yaml`.
+* `-s <selector>`: Execute the command only in accounts whose friendly names match the selector. The selector can be:
+    * A single name (e.g., `data-dev`).
+    * A pattern with `*` wildcards (e.g., `infra-*`).
+    * Multiple space-separated names/patterns enclosed in quotes (e.g., `"data-dev data-tst infra-*"`).
+
+## Optional Flags:
+
+* `-regions <region1,region2,...>`: Comma-separated list of AWS regions to run the command in. If omitted, `saws` attempts to use the default region from your AWS configuration/environment; if that's not found, it falls back to `eu-west-1`.
+* `-config <path>`: Specify a custom path to the `saws-config.yaml` file.
+
+## Examples:
+
+**List S3 buckets in all `infra-*` accounts in `eu-central-1`:**
+
+```bash
+saws -r InfraAdmin -c "aws s3 ls" -s "infra-*" -regions eu-central-1
+```
+Describe VPCs in data-dev and data-tst accounts across two regions:
+```
+saws -r ReadOnly -c "aws ec2 describe-vpcs --query 'Vpcs[*].VpcId'" -s "data-dev data-tst" -regions "eu-west-1,us-east-1"
+```
+Check IAM users in all accounts using the default region:
+```
+saws -r Admin -c "aws iam list-users --output count" -a
+```
+## Environment Setup Mode (`-e`)
+
+This mode interactively prompts you to select an account, role, and region, assumes the role, and then prints `export` commands to standard output. You can use `eval` to apply these temporary credentials to your current shell session.
+
+### Syntax:
+
+```bash
+eval $(saws -e [-config <path>])
+```
+### Optional Flags:
+
+* `-config <path>`: Specify a custom path to the `saws-config.yaml` file.
+
+**Flags Ignored/Disallowed in this mode:** `-r`, `-c`, `-a`, `-s`, `-regions`.
+
+### How it Works:
+
+1.  Run `eval $(saws -e)`.
+2.  `saws` will prompt you to select an **Account** from the list defined in your `saws-config.yaml`.
+3.  `saws` will then check if the `roles` map exists in your config:
+    * If **yes**, it will prompt you to select a **Role** from the friendly names listed there.
+    * If **no**, it will prompt you to manually type the exact **IAM Role Name** you want to assume.
+4.  Finally, it will prompt you to select a **Region** from the `common_regions` list in your config.
+5.  If successful, `saws` prints `export` commands (which `eval` applies to your shell). Status messages (like success confirmation and expiration time) are printed to standard error.
+
+### Example:
+```
+# Start interactive setup
+eval $(saws -e)
+
+# Follow the prompts:
+# ? Choose an AWS Account: data-dev  [Use arrows and Enter]
+# ? Choose Role to Assume: Admin     [Use arrows and Enter - shown if roles defined in config]
+# ? Choose AWS Region: eu-west-1  [Use arrows and Enter]
+
+# (If successful, saws prints status messages to stderr)
+# 2025/05/01 07:40:45 Success! AWS credentials exported for role 'OrganizationAccountAccessRole' in account 'data-dev' (eu-west-1).
+# 2025/05/01 07:40:45 Session expires around: Thu, 01 May 2025 08:40:45 CEST
+# 2025/05/01 07:40:45 Run 'unset AWS_ACCESS_KEY_ID ...' or open a new terminal to clear.
+
+# Now your shell has the temporary credentials:
+aws sts get-caller-identity
+aws s3 ls --region eu-west-1
+
+# When finished, unset the credentials:
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION AWS_DEFAULT_REGION
+```
