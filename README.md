@@ -68,23 +68,34 @@
 
 * **Start an interactive sub-shell:**
     ```bash
-    # Get a sub-shell for the 'prod-data' account, 'Admin' role, in 'eu-west-1'
+    saws -e
+
+    OR
+    
     saws -e -s prod-data -r Admin -region eu-west-1
-    #
-    # (Inside the new shell, AWS credentials are set)
-    # aws sts get-caller-identity
-    # exit (to leave the sub-shell)
     ```
 
 * **Connect to an ECS container (interactively):**
     ```bash
-    # Select cluster, task, and container for 'dev-main' account with 'Developer' role
+    saws -ecs
+
+    OR
+    
     saws -ecs -s dev-main -r Developer -region us-east-1
     ```
 
 * **Connect to an EC2 instance via SSM (directly):**
     ```bash
+    saws -ssm
+
+    OR
+    
     saws -ssm -i i-0123456789abcdef0 -s prod-data -r Admin -region eu-west-1
     ```
 
 For more detailed options and examples, refer to the full help message using `saws -h`.
+
+## Contribute
+In case that you are interested or thinking of a feature, feel free to make a PR or ask me to do so.
+Copyright 2025 Hosein Yousefi yousefi.hosein.o@gmail.com
+
