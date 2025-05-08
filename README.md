@@ -66,7 +66,7 @@
     saws -c "aws s3 ls" -r Developer -s "dev-*" -regions us-east-1
     ```
 
-* **Start an interactive sub-shell:**
+* **Start an interactive sub-shell:**  [Watch here](docs/saws-e.gif)
     ```bash
     saws -e
 
@@ -75,7 +75,7 @@
     saws -e -s prod-data -r Admin -region eu-west-1
     ```
 
-* **Connect to an ECS container (interactively):**
+* **Connect to an ECS container (interactively):**  [Watch here](docs/saws-ecs.gif)
     ```bash
     saws -ecs
 
@@ -84,7 +84,7 @@
     saws -ecs -s dev-main -r Developer -region us-east-1
     ```
 
-* **Connect to an EC2 instance via SSM (directly):**
+* **Connect to an EC2 instance via SSM (directly):**  [Watch here](docs/saws-ssm.gif)
     ```bash
     saws -ssm
 
