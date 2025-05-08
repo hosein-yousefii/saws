@@ -1,4 +1,4 @@
-# saws (Super AWS)
+# saws (Super AWS) 🪚:
 
 `saws` is a Go CLI tool to streamline interactions with multiple AWS accounts and roles. It enables you to:
 
