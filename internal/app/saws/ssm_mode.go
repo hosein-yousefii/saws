@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"saws/internal/pkg"
@@ -191,4 +193,160 @@ func HandleSSMSession(ctx context.Context, instanceIDFromFlag, accountSelectorFl
 		}
 	}
 	return nil
+}
+
+func ProcessSsmCommandOnAccountRegion(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	baseCfg aws.Config,
+	appCfg *pkg.AppConfig,
+	accountName string,
+	roleToAssume string,
+	commandToRun string,
+	region string,
+	instanceIDFromFlag string,
+	successCounter *atomic.Int64,
+	totalCounter *atomic.Int64,
+) {
+	defer wg.Done()
+
+	accountID, accountExists := appCfg.Accounts[accountName]
+	if !accountExists {
+		pkg.LogVerbosef("ERROR: Account ID not found for SAWS config account name '%s'. Skipping.", accountName)
+		return
+	}
+
+	assumedRoleCreds, err := pkg.AssumeRole(ctx, baseCfg, accountID, roleToAssume, "SsmCmdExecSess")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Assume Role Failed Account:%s Region:%s Role:%s: %v\n", accountName, region, roleToAssume, err)
+		return
+	}
+	awsCreds := aws.Credentials{AccessKeyID: *assumedRoleCreds.AccessKeyId, SecretAccessKey: *assumedRoleCreds.SecretAccessKey, SessionToken: *assumedRoleCreds.SessionToken}
+
+	var targetInstanceIDs []string
+	if instanceIDFromFlag != "" {
+		targetInstanceIDs = []string{instanceIDFromFlag}
+		pkg.LogVerbosef("Targeting specific instance %s in Account %s, Region %s", instanceIDFromFlag, accountName, region)
+	} else {
+		instanceList, errList := GetSSMInstanceInfoList(ctx, awsCreds, region)
+		if errList != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: Failed to list SSM instances for Account %s, Region %s: %v\n", accountName, region, errList)
+			return
+		}
+		if len(instanceList) == 0 {
+			pkg.LogVerbosef("No SSM-managed instances found in Account %s, Region %s. Skipping.", accountName, region)
+			return
+		}
+		for _, info := range instanceList {
+			if info.InstanceId != nil {
+				targetInstanceIDs = append(targetInstanceIDs, *info.InstanceId)
+			}
+		}
+		pkg.LogVerbosef("Found %d instances to target in Account %s, Region %s", len(targetInstanceIDs), accountName, region)
+	}
+
+	totalCounter.Add(int64(len(targetInstanceIDs)))
+
+	var instanceWg sync.WaitGroup
+	for _, instanceID := range targetInstanceIDs {
+		instanceWg.Add(1)
+		go executeSsmCommandOnInstance(ctx, &instanceWg, awsCreds, region, accountName, instanceID, commandToRun, successCounter)
+	}
+	instanceWg.Wait()
+}
+
+func executeSsmCommandOnInstance(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	creds aws.Credentials,
+	region, accountName, instanceID, command string,
+	successCounter *atomic.Int64,
+) {
+	defer wg.Done()
+	startTime := time.Now()
+
+	cfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithCredentialsProvider(aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) { return creds, nil })),
+		awsconfig.WithRegion(region),
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to load SDK config for SSM command on %s: %v\n", instanceID, err)
+		return
+	}
+	ssmClient := ssm.NewFromConfig(cfg)
+
+	sendCmdOutput, err := ssmClient.SendCommand(ctx, &ssm.SendCommandInput{
+		InstanceIds:    []string{instanceID},
+		DocumentName:   aws.String("AWS-RunShellScript"),
+		Parameters:     map[string][]string{"commands": {command}},
+		TimeoutSeconds: aws.Int32(300),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to send command to instance %s: %v\n", instanceID, err)
+		return
+	}
+	commandID := *sendCmdOutput.Command.CommandId
+
+	// Wait for command to complete
+	var invocationOutput *ssm.GetCommandInvocationOutput
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Fprintf(os.Stderr, "ERROR: Context cancelled while waiting for command on %s\n", instanceID)
+			return
+		case <-time.After(5 * time.Second): // Polling interval
+		}
+
+		invocationOutput, err = ssmClient.GetCommandInvocation(ctx, &ssm.GetCommandInvocationInput{
+			CommandId:  aws.String(commandID),
+			InstanceId: aws.String(instanceID),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: Failed to get command invocation for instance %s: %v\n", instanceID, err)
+			return
+		}
+
+		status := invocationOutput.Status
+		if status == ssmtypes.CommandInvocationStatusSuccess ||
+			status == ssmtypes.CommandInvocationStatusFailed ||
+			status == ssmtypes.CommandInvocationStatusCancelled ||
+			status == ssmtypes.CommandInvocationStatusTimedOut ||
+			status == ssmtypes.CommandInvocationStatusCancelling {
+			break
+		}
+	}
+
+	duration := time.Since(startTime)
+	status := string(invocationOutput.Status)
+	exitCode := int(invocationOutput.ResponseCode)
+
+	fmt.Printf("--- Result (Account: %s, Region: %s, Instance: %s, Status: %s, Exit Code: %d, Duration: %s) ---\n",
+		accountName, region, instanceID, status, exitCode, duration.Round(time.Millisecond))
+
+	stdOutput := ""
+	if invocationOutput.StandardOutputContent != nil {
+		stdOutput = strings.TrimSpace(*invocationOutput.StandardOutputContent)
+	}
+	errOutput := ""
+	if invocationOutput.StandardErrorContent != nil {
+		errOutput = strings.TrimSpace(*invocationOutput.StandardErrorContent)
+	}
+
+	if stdOutput != "" {
+		fmt.Println("[STDOUT]")
+		fmt.Println(stdOutput)
+	}
+	if errOutput != "" {
+		if exitCode != 0 {
+			fmt.Println("[STDERR]")
+		} else {
+			fmt.Println("[STDERR (Exit Code 0)]")
+		}
+		fmt.Println(errOutput)
+	}
+	fmt.Println("--- End Result ---")
+
+	if exitCode == 0 && invocationOutput.Status == ssmtypes.CommandInvocationStatusSuccess {
+		successCounter.Add(1)
+	}
 }

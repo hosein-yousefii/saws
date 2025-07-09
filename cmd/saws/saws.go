@@ -30,8 +30,9 @@ Modes:
                   Optional: -regions
   -e            Interactive Sub-Shell: Start a sub-shell with assumed role credentials.
                   Optional: -s, -r, -region (or use env vars / interactive prompts)
-  -ssm          SSM Session: Start an interactive SSM session to an EC2 instance.
-                  Optional: -i, -s, -r, -region (prompts if needed)
+  -ssm          SSM Session: Start an interactive SSM session to an EC2 instance, or execute a command on instances.
+                  For interactive session: Optional: -i, -s, -r, -region (prompts if needed)
+                  For command execution: Requires: -c, -r, (-a | -s). Optional: -regions, -i.
   -ecs          ECS Exec Session: Start an interactive exec session to an ECS container.
                   Optional: --ecs-cluster, --ecs-task, --ecs-container, --ecs-command,
                             -s, -r, -region (prompts if needed)
@@ -49,7 +50,8 @@ Command Mode Options (-c):
   -a             Process all accounts defined in config.
 
 SSM Session Mode Options (-ssm):
-  -i <inst-id>  Target EC2 instance ID (if omitted, instances will be listed for selection).
+  -c <cmd>      Command to execute on target instance(s). If provided, turns on command execution for SSM.
+  -i <inst-id>  Target EC2 instance ID. For interactive session, if omitted, instances will be listed. For command execution, if omitted, command runs on all managed instances in the account/region.
 
 ECS Exec Session Mode Options (-ecs):
   --ecs-cluster <name|arn>  Target ECS cluster.
@@ -65,10 +67,13 @@ Examples:
   saws -e
   saws -e -s dev-1 -r Admin -region us-east-1
 
-  # SSM Session (direct connect):
+  # SSM Session (interactive):
   saws -ssm
   saws -ssm -i i-0123... -s prod-web -r Admin -region eu-central-1
-  saws -ssm -s prod-db -r DBAccess -region us-west-2
+  
+  # SSM Session (command execution):
+  saws -ssm -c "uname -a" -s "prod-*" -r Admin -regions "us-east-1,eu-west-1"
+  saws -ssm -c "df -h" -i i-0123... -s prod-db -r DBAccess -region us-west-2
 
   # ECS Exec Session (direct connect to a specific container):
   saws -ecs --ecs-cluster my-cluster --ecs-task a1b2c3d4e5 --ecs-container my-app-container -s prod-app -r AppAdmin -region us-east-1
@@ -91,16 +96,16 @@ func main() {
 	verbose := flag.Bool("v", false, "Enable verbose logging.")
 
 	// Command Mode flags
-	command := flag.String("c", "", "Command to execute (enables Command Execution Mode).")
-	cmdRegionsStr := flag.String("regions", "", "Comma-separated regions for command execution (Command Mode only).")
-	processAll := flag.Bool("a", false, "Process ALL accounts (Command Mode only).")
+	command := flag.String("c", "", "Command to execute.")
+	cmdRegionsStr := flag.String("regions", "", "Comma-separated regions for command execution (Command and SSM-Command Modes only).")
+	processAll := flag.Bool("a", false, "Process ALL accounts (Command and SSM-Command Modes only).")
 
 	// Interactive Sub-Shell Mode flag
 	sessionModeFlag := flag.Bool("e", false, "Enable interactive sub-shell session mode.")
 
 	// SSM Session Mode flags
-	ssmSessionFlag := flag.Bool("ssm", false, "Enable interactive SSM session to an EC2 instance.")
-	instanceIDFlag := flag.String("i", "", "Target EC2 instance ID for SSM session (Optional).")
+	ssmSessionFlag := flag.Bool("ssm", false, "Enable interactive SSM session or command execution on EC2 instances.")
+	instanceIDFlag := flag.String("i", "", "Target EC2 instance ID for SSM session/command (Optional).")
 
 	// ECS Exec Session Mode flags
 	ecsModeFlag := flag.Bool("ecs", false, "Enable interactive ECS exec session mode.")
@@ -137,47 +142,61 @@ func main() {
 		return
 	}
 
-	isCommandMode := *command != ""
-	isSessionMode := *sessionModeFlag
-	isSSMSessionMode := *ssmSessionFlag
-	isECSMode := *ecsModeFlag
-
-	modeCount := 0
-	if isCommandMode {
-		modeCount++
-	}
-	if isSessionMode {
-		modeCount++
-	}
-	if isSSMSessionMode {
-		modeCount++
-	}
-	if isECSMode {
-		modeCount++
-	}
-
-	if modeCount > 1 {
-		fmt.Fprintln(os.Stderr, "Error: Cannot use -c, -e, -ssm, and -ecs flags together. Please choose one mode.")
-		usage()
-	}
-	if modeCount == 0 {
-		fmt.Fprintln(os.Stderr, "Error: No mode selected. Please specify -c, -e, -ssm, or -ecs.")
-		usage()
-	}
-
-	if isSessionMode {
+	modeSelected := true
+	if *ssmSessionFlag {
+		if *command != "" {
+			// SSM Command Execution Mode
+			handleSsmCommandMode(ctx, appConfig, *command, *selector, *roleCmd, *cmdRegionsStr, *processAll, *instanceIDFlag)
+		} else {
+			// Interactive SSM Session
+			if *cmdRegionsStr != "" {
+				fmt.Fprintln(os.Stderr, "Warning: -regions flag ignored in interactive SSM session mode. Use -region for context.")
+			}
+			if *processAll {
+				fmt.Fprintln(os.Stderr, "Warning: -a flag ignored in interactive SSM session mode.")
+			}
+			if *ecsClusterFlag != "" || *ecsTaskFlag != "" || *ecsContainerFlag != "" || *ecsCommandFlag != "" {
+				fmt.Fprintln(os.Stderr, "Warning: --ecs-* flags are ignored in interactive SSM session mode.")
+			}
+			errCtx := saws.HandleSSMSession(ctx, *instanceIDFlag, *selector, *roleCmd, *contextRegionFlag)
+			if errCtx != nil {
+				fmt.Fprintf(os.Stderr, "SSM session failed: %v\n", errCtx)
+				os.Exit(1)
+			}
+		}
+	} else if *ecsModeFlag {
+		// ECS Exec Session Mode
 		if *cmdRegionsStr != "" {
-			fmt.Fprintln(os.Stderr, "Warning: -regions flag ignored in interactive session mode (-e). Use -region for context.")
+			fmt.Fprintln(os.Stderr, "Warning: -regions flag ignored in ECS exec session mode. Use -region for context.")
 		}
 		if *processAll {
-			fmt.Fprintln(os.Stderr, "Warning: -a flag ignored in interactive session mode (-e).")
+			fmt.Fprintln(os.Stderr, "Warning: -a flag ignored in ECS exec session mode.")
+		}
+		if *command != "" {
+			fmt.Fprintln(os.Stderr, "Warning: -c flag (command execution mode) ignored in ECS exec session mode. Use --ecs-command for the container command.")
 		}
 		if *instanceIDFlag != "" {
-			fmt.Fprintln(os.Stderr, "Warning: -i (instance-id) flag ignored in interactive sub-shell mode (-e). Used with -ssm.")
+			fmt.Fprintln(os.Stderr, "Warning: -i (instance-id) flag ignored in ECS exec session mode.")
 		}
-		// Warnings for ECS flags if -e is used
+
+		errCtx := saws.HandleEcsExecSession(ctx, appConfig, *ecsClusterFlag, *ecsTaskFlag, *ecsContainerFlag, *ecsCommandFlag, *selector, *roleCmd, *contextRegionFlag)
+		if errCtx != nil {
+			fmt.Fprintf(os.Stderr, "ECS exec session failed: %v\n", errCtx)
+			os.Exit(1)
+		}
+	} else if *sessionModeFlag {
+		// Interactive Sub-Shell Mode
+		if *cmdRegionsStr != "" {
+			fmt.Fprintln(os.Stderr, "Warning: -regions flag ignored in interactive sub-shell mode. Use -region for context.")
+		}
+		if *processAll {
+			fmt.Fprintln(os.Stderr, "Warning: -a flag ignored in interactive sub-shell mode.")
+		}
+		if *instanceIDFlag != "" {
+			fmt.Fprintln(os.Stderr, "Warning: -i (instance-id) flag ignored in interactive sub-shell mode.")
+		}
 		if *ecsClusterFlag != "" || *ecsTaskFlag != "" || *ecsContainerFlag != "" || *ecsCommandFlag != "" {
-			fmt.Fprintln(os.Stderr, "Warning: --ecs-* flags are ignored in interactive sub-shell mode (-e). Used with -ecs.")
+			fmt.Fprintln(os.Stderr, "Warning: --ecs-* flags are ignored in interactive sub-shell mode.")
 		}
 
 		sCtx, creds, errCtx := pkg.EstablishAWSContextAndAssumeRole(ctx, *selector, *roleCmd, *contextRegionFlag, "InteractiveSubShell")
@@ -197,52 +216,8 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Interactive sub-shell session failed: %v\n", errCtx)
 			os.Exit(1)
 		}
-		os.Exit(0)
-
-	} else if isSSMSessionMode {
-		if *cmdRegionsStr != "" {
-			fmt.Fprintln(os.Stderr, "Warning: -regions flag ignored in SSM session mode (-ssm). Use -region for context.")
-		}
-		if *processAll {
-			fmt.Fprintln(os.Stderr, "Warning: -a flag ignored in SSM session mode (-ssm).")
-		}
-		if *command != "" { // -c flag for command mode
-			fmt.Fprintln(os.Stderr, "Warning: -c (command) flag ignored in SSM session mode (-ssm).")
-		}
-		// Warnings for ECS flags if -ssm is used
-		if *ecsClusterFlag != "" || *ecsTaskFlag != "" || *ecsContainerFlag != "" || *ecsCommandFlag != "" {
-			fmt.Fprintln(os.Stderr, "Warning: --ecs-* flags are ignored in SSM session mode (-ssm). Used with -ecs.")
-		}
-
-		errCtx := saws.HandleSSMSession(ctx, *instanceIDFlag, *selector, *roleCmd, *contextRegionFlag)
-		if errCtx != nil {
-			fmt.Fprintf(os.Stderr, "SSM session failed: %v\n", errCtx)
-			os.Exit(1)
-		}
-		os.Exit(0)
-
-	} else if isECSMode {
-		if *cmdRegionsStr != "" {
-			fmt.Fprintln(os.Stderr, "Warning: -regions flag ignored in ECS exec session mode (-ecs). Use -region for context.")
-		}
-		if *processAll {
-			fmt.Fprintln(os.Stderr, "Warning: -a flag ignored in ECS exec session mode (-ecs).")
-		}
-		if *command != "" { // -c flag for command execution mode
-			fmt.Fprintln(os.Stderr, "Warning: -c (command execution mode command) flag ignored in ECS exec session mode (-ecs). Use --ecs-command for container command.")
-		}
-		if *instanceIDFlag != "" { // -i flag for ssm mode
-			fmt.Fprintln(os.Stderr, "Warning: -i (instance-id) flag ignored in ECS exec session mode (-ecs).")
-		}
-
-		errCtx := saws.HandleEcsExecSession(ctx, appConfig, *ecsClusterFlag, *ecsTaskFlag, *ecsContainerFlag, *ecsCommandFlag, *selector, *roleCmd, *contextRegionFlag)
-		if errCtx != nil {
-			fmt.Fprintf(os.Stderr, "ECS exec session failed: %v\n", errCtx)
-			os.Exit(1)
-		}
-		os.Exit(0)
-
-	} else if isCommandMode {
+	} else if *command != "" {
+		// Command Execution Mode
 		if *roleCmd == "" {
 			fmt.Fprintln(os.Stderr, "Error: Role (-r) is mandatory for Command Execution Mode.")
 			usage()
@@ -259,7 +234,6 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: AWS CLI ('aws') not found in PATH. Required for Command Mode.\n")
 			os.Exit(1)
 		}
-		// Warnings for ECS flags if -c is used
 		if *ecsClusterFlag != "" || *ecsTaskFlag != "" || *ecsContainerFlag != "" || *ecsCommandFlag != "" {
 			fmt.Fprintln(os.Stderr, "Warning: --ecs-* flags are ignored in command execution mode (-c). Used with -ecs.")
 		}
@@ -267,115 +241,249 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Warning: -i (instance-id) flag ignored in command execution mode (-c). Used with -ssm.")
 		}
 
-		var targetRegionsCmd []string
-		regionsInput := strings.TrimSpace(*cmdRegionsStr)
-		if regionsInput != "" {
-			rawRegions := strings.Split(regionsInput, ",")
-			for _, r := range rawRegions {
-				trimmed := strings.TrimSpace(r)
-				if trimmed != "" {
-					targetRegionsCmd = append(targetRegionsCmd, trimmed)
-				}
-			}
-			if len(targetRegionsCmd) == 0 {
-				fmt.Fprintln(os.Stderr, "Error: -regions flag provided but contained no valid region names after trimming.")
-				os.Exit(1)
-			}
-			pkg.LogVerbosef("Cmd Mode: Using specified regions: %v", targetRegionsCmd)
-		} else {
-			pkg.LogVerbosef("Cmd Mode: No -regions flag provided. Determining default region...")
-			tempCfg, errCfg := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithSharedConfigProfile(pkg.BaseProfileForAssume))
-			defaultCmdRegion := pkg.FallbackRegion
-			if errCfg != nil {
-				pkg.LogVerbosef("Warning: Could not load AWS config to determine default region: %v. Falling back to '%s'.", errCfg, defaultCmdRegion)
-			} else if tempCfg.Region == "" {
-				pkg.LogVerbosef("Warning: Could not determine default region from AWS config/environment. Falling back to '%s'.", defaultCmdRegion)
-			} else {
-				defaultCmdRegion = tempCfg.Region
-				pkg.LogVerbosef("Cmd Mode: Using default region from AWS config/environment: %s", defaultCmdRegion)
-			}
-			targetRegionsCmd = []string{defaultCmdRegion}
-		}
+		handleAwsCommandMode(ctx, appConfig, *command, *selector, *roleCmd, *cmdRegionsStr, *processAll)
+	} else {
+		modeSelected = false
+	}
 
-		var targetAccountNames []string
-		allAccountNamesSorted := make([]string, 0, len(appConfig.Accounts))
-		for name := range appConfig.Accounts {
-			allAccountNamesSorted = append(allAccountNamesSorted, name)
-		}
-		sort.Strings(allAccountNamesSorted)
-		if *processAll {
-			targetAccountNames = allAccountNamesSorted
-			pkg.LogVerbosef("Cmd Mode Accounts: Processing all %d defined accounts.", len(targetAccountNames))
-		} else {
-			rawPatterns := strings.Split(*selector, ",")
-			selectorPatterns := []string{}
-			for _, p := range rawPatterns {
-				trimmed := strings.TrimSpace(p)
-				if trimmed != "" {
-					selectorPatterns = append(selectorPatterns, trimmed)
-				}
-			}
-			if len(selectorPatterns) == 0 {
-				fmt.Fprintf(os.Stderr, "Error: Selector flag '-s \"%s\"' provided no valid names/patterns.\n", *selector)
-				os.Exit(1)
-			}
-			matchedAccountsMap := make(map[string]struct{})
-			pkg.LogVerbosef("Cmd Mode: Applying selector patterns: %v", selectorPatterns)
-			for _, accName := range allAccountNamesSorted {
-				for _, pattern := range selectorPatterns {
-					match, errMatch := filepath.Match(pattern, accName)
-					if errMatch != nil {
-						pkg.LogVerbosef("Warning: Invalid pattern '%s' in selector: %v.", pattern, errMatch)
-						continue
-					}
-					if match {
-						matchedAccountsMap[accName] = struct{}{}
-						break
-					}
-				}
-			}
-			for accName := range matchedAccountsMap {
-				targetAccountNames = append(targetAccountNames, accName)
-			}
-			sort.Strings(targetAccountNames)
-			pkg.LogVerbosef("Cmd Mode: Selected %d account(s) using selector '%s': %v", len(targetAccountNames), *selector, targetAccountNames)
-			if len(targetAccountNames) == 0 {
-				fmt.Fprintf(os.Stderr, "Error: No accounts found matching selector patterns: %v\n", selectorPatterns)
-				os.Exit(1)
-			}
-		}
+	if !modeSelected {
+		fmt.Fprintln(os.Stderr, "Error: No mode selected. Please specify one of: -ssm, -ecs, -e, -c.")
+		usage()
+	}
+}
 
-		baseCfgAWS, errCfg := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithSharedConfigProfile(pkg.BaseProfileForAssume), awsconfig.WithRegion(pkg.FallbackRegion))
+func handleAwsCommandMode(ctx context.Context, appConfig *pkg.AppConfig, command, selector, roleCmd, cmdRegionsStr string, processAll bool) {
+	var targetRegionsCmd []string
+	regionsInput := strings.TrimSpace(cmdRegionsStr)
+	if regionsInput != "" {
+		rawRegions := strings.Split(regionsInput, ",")
+		for _, r := range rawRegions {
+			trimmed := strings.TrimSpace(r)
+			if trimmed != "" {
+				targetRegionsCmd = append(targetRegionsCmd, trimmed)
+			}
+		}
+		if len(targetRegionsCmd) == 0 {
+			fmt.Fprintln(os.Stderr, "Error: -regions flag provided but contained no valid region names after trimming.")
+			os.Exit(1)
+		}
+		pkg.LogVerbosef("Cmd Mode: Using specified regions: %v", targetRegionsCmd)
+	} else {
+		pkg.LogVerbosef("Cmd Mode: No -regions flag provided. Determining default region...")
+		tempCfg, errCfg := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithSharedConfigProfile(pkg.BaseProfileForAssume))
+		defaultCmdRegion := pkg.FallbackRegion
 		if errCfg != nil {
-			fmt.Fprintf(os.Stderr, "Error loading base AWS configuration (profile '%s'): %v\n", pkg.BaseProfileForAssume, errCfg)
-			os.Exit(1)
+			pkg.LogVerbosef("Warning: Could not load AWS config to determine default region: %v. Falling back to '%s'.", errCfg, defaultCmdRegion)
+		} else if tempCfg.Region == "" {
+			pkg.LogVerbosef("Warning: Could not determine default region from AWS config/environment. Falling back to '%s'.", defaultCmdRegion)
+		} else {
+			defaultCmdRegion = tempCfg.Region
+			pkg.LogVerbosef("Cmd Mode: Using default region from AWS config/environment: %s", defaultCmdRegion)
 		}
+		targetRegionsCmd = []string{defaultCmdRegion}
+	}
 
-		totalExecutions := len(targetAccountNames) * len(targetRegionsCmd)
-		pkg.LogVerbosef("Cmd Mode: Planning %d executions (%d accounts x %d regions).", totalExecutions, len(targetAccountNames), len(targetRegionsCmd))
-		var wg sync.WaitGroup
-		var successfulExecutions atomic.Int64
-		startTime := time.Now()
-
-		for _, accountName := range targetAccountNames {
-			for _, region := range targetRegionsCmd {
-				wg.Add(1)
-				accName := accountName
-				reg := region
-				go saws.ProcessAccountRegion(ctx, &wg, baseCfgAWS, appConfig, accName, *roleCmd, *command, reg, &successfulExecutions)
+	var targetAccountNames []string
+	allAccountNamesSorted := make([]string, 0, len(appConfig.Accounts))
+	for name := range appConfig.Accounts {
+		allAccountNamesSorted = append(allAccountNamesSorted, name)
+	}
+	sort.Strings(allAccountNamesSorted)
+	if processAll {
+		targetAccountNames = allAccountNamesSorted
+		pkg.LogVerbosef("Cmd Mode Accounts: Processing all %d defined accounts.", len(targetAccountNames))
+	} else {
+		rawPatterns := strings.Split(selector, ",")
+		selectorPatterns := []string{}
+		for _, p := range rawPatterns {
+			trimmed := strings.TrimSpace(p)
+			if trimmed != "" {
+				selectorPatterns = append(selectorPatterns, trimmed)
 			}
 		}
-		wg.Wait()
-		totalDuration := time.Since(startTime)
-
-		finalSuccessCount := successfulExecutions.Load()
-		pkg.LogVerbosef("Cmd Mode: Finished %d executions in %s.", totalExecutions, totalDuration.Round(time.Second))
-		if finalSuccessCount == int64(totalExecutions) {
-			pkg.LogVerbosef("Cmd Mode: All %d executions completed successfully.", finalSuccessCount)
-			os.Exit(0)
-		} else {
-			fmt.Fprintf(os.Stderr, "Cmd Mode: %d out of %d targeted executions completed successfully. %d failed.\n", finalSuccessCount, totalExecutions, int64(totalExecutions)-finalSuccessCount)
+		if len(selectorPatterns) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: Selector flag '-s \"%s\"' provided no valid names/patterns.\n", selector)
 			os.Exit(1)
 		}
+		matchedAccountsMap := make(map[string]struct{})
+		pkg.LogVerbosef("Cmd Mode: Applying selector patterns: %v", selectorPatterns)
+		for _, accName := range allAccountNamesSorted {
+			for _, pattern := range selectorPatterns {
+				match, errMatch := filepath.Match(pattern, accName)
+				if errMatch != nil {
+					pkg.LogVerbosef("Warning: Invalid pattern '%s' in selector: %v.", pattern, errMatch)
+					continue
+				}
+				if match {
+					matchedAccountsMap[accName] = struct{}{}
+					break
+				}
+			}
+		}
+		for accName := range matchedAccountsMap {
+			targetAccountNames = append(targetAccountNames, accName)
+		}
+		sort.Strings(targetAccountNames)
+		pkg.LogVerbosef("Cmd Mode: Selected %d account(s) using selector '%s': %v", len(targetAccountNames), selector, targetAccountNames)
+		if len(targetAccountNames) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: No accounts found matching selector patterns: %v\n", selectorPatterns)
+			os.Exit(1)
+		}
+	}
+
+	baseCfgAWS, errCfg := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithSharedConfigProfile(pkg.BaseProfileForAssume), awsconfig.WithRegion(pkg.FallbackRegion))
+	if errCfg != nil {
+		fmt.Fprintf(os.Stderr, "Error loading base AWS configuration (profile '%s'): %v\n", pkg.BaseProfileForAssume, errCfg)
+		os.Exit(1)
+	}
+
+	totalExecutions := len(targetAccountNames) * len(targetRegionsCmd)
+	pkg.LogVerbosef("Cmd Mode: Planning %d executions (%d accounts x %d regions).", totalExecutions, len(targetAccountNames), len(targetRegionsCmd))
+	var wg sync.WaitGroup
+	var successfulExecutions atomic.Int64
+	startTime := time.Now()
+
+	for _, accountName := range targetAccountNames {
+		for _, region := range targetRegionsCmd {
+			wg.Add(1)
+			accName := accountName
+			reg := region
+			go saws.ProcessAccountRegion(ctx, &wg, baseCfgAWS, appConfig, accName, roleCmd, command, reg, &successfulExecutions)
+		}
+	}
+	wg.Wait()
+	totalDuration := time.Since(startTime)
+
+	finalSuccessCount := successfulExecutions.Load()
+	pkg.LogVerbosef("Cmd Mode: Finished %d executions in %s.", totalExecutions, totalDuration.Round(time.Second))
+	if finalSuccessCount == int64(totalExecutions) {
+		pkg.LogVerbosef("Cmd Mode: All %d executions completed successfully.", finalSuccessCount)
+		os.Exit(0)
+	} else {
+		fmt.Fprintf(os.Stderr, "Cmd Mode: %d out of %d targeted executions completed successfully. %d failed.\n", finalSuccessCount, totalExecutions, int64(totalExecutions)-finalSuccessCount)
+		os.Exit(1)
+	}
+}
+
+func handleSsmCommandMode(ctx context.Context, appConfig *pkg.AppConfig, command, selector, roleCmd, cmdRegionsStr string, processAll bool, instanceID string) {
+	if roleCmd == "" {
+		fmt.Fprintln(os.Stderr, "Error: Role (-r) is mandatory for SSM Command Mode.")
+		usage()
+	}
+	if processAll && selector != "" {
+		fmt.Fprintln(os.Stderr, "Error: Cannot use both -a and -s in SSM Command Mode.")
+		usage()
+	}
+	if !processAll && selector == "" {
+		fmt.Fprintln(os.Stderr, "Error: Must use -a or -s in SSM Command Mode.")
+		usage()
+	}
+
+	var targetRegions []string
+	regionsInput := strings.TrimSpace(cmdRegionsStr)
+	if regionsInput != "" {
+		rawRegions := strings.Split(regionsInput, ",")
+		for _, r := range rawRegions {
+			trimmed := strings.TrimSpace(r)
+			if trimmed != "" {
+				targetRegions = append(targetRegions, trimmed)
+			}
+		}
+		if len(targetRegions) == 0 {
+			fmt.Fprintln(os.Stderr, "Error: -regions flag provided but contained no valid region names after trimming.")
+			os.Exit(1)
+		}
+		pkg.LogVerbosef("SSM Cmd Mode: Using specified regions: %v", targetRegions)
+	} else {
+		pkg.LogVerbosef("SSM Cmd Mode: No -regions flag provided. Will use region from context for each account.")
+	}
+
+	var targetAccountNames []string
+	allAccountNamesSorted := make([]string, 0, len(appConfig.Accounts))
+	for name := range appConfig.Accounts {
+		allAccountNamesSorted = append(allAccountNamesSorted, name)
+	}
+	sort.Strings(allAccountNamesSorted)
+	if processAll {
+		targetAccountNames = allAccountNamesSorted
+		pkg.LogVerbosef("SSM Cmd Mode Accounts: Processing all %d defined accounts.", len(targetAccountNames))
+	} else {
+		rawPatterns := strings.Split(selector, ",")
+		patterns := []string{}
+		for _, p := range rawPatterns {
+			trimmed := strings.TrimSpace(p)
+			if trimmed != "" {
+				patterns = append(patterns, trimmed)
+			}
+		}
+		if len(patterns) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: Selector flag '-s \"%s\"' provided no valid names/patterns.\n", selector)
+			os.Exit(1)
+		}
+		matchedMap := make(map[string]struct{})
+		for _, accName := range allAccountNamesSorted {
+			for _, pattern := range patterns {
+				match, _ := filepath.Match(pattern, accName)
+				if match {
+					matchedMap[accName] = struct{}{}
+					break
+				}
+			}
+		}
+		for accName := range matchedMap {
+			targetAccountNames = append(targetAccountNames, accName)
+		}
+		sort.Strings(targetAccountNames)
+		pkg.LogVerbosef("SSM Cmd Mode: Selected %d account(s) using selector '%s': %v", len(targetAccountNames), selector, targetAccountNames)
+		if len(targetAccountNames) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: No accounts found matching selector patterns: %v\n", patterns)
+			os.Exit(1)
+		}
+	}
+
+	baseCfgAWS, errCfg := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithSharedConfigProfile(pkg.BaseProfileForAssume), awsconfig.WithRegion(pkg.FallbackRegion))
+	if errCfg != nil {
+		fmt.Fprintf(os.Stderr, "Error loading base AWS configuration (profile '%s'): %v\n", pkg.BaseProfileForAssume, errCfg)
+		os.Exit(1)
+	}
+
+	var wg sync.WaitGroup
+	var successfulExecutions, totalExecutions atomic.Int64
+	startTime := time.Now()
+
+	for _, accountName := range targetAccountNames {
+		regionsForAccount := targetRegions
+		if len(regionsForAccount) == 0 {
+			// If no regions are specified via flag, we need to determine them.
+			// For simplicity, let's just use the default region for now. A more advanced implementation
+			// could check regions defined in the config or prompt the user.
+			tempCfg, _ := awsconfig.LoadDefaultConfig(ctx)
+			defaultRegion := tempCfg.Region
+			if defaultRegion == "" {
+				defaultRegion = pkg.FallbackRegion
+			}
+			regionsForAccount = []string{defaultRegion}
+			pkg.LogVerbosef("SSM Cmd Mode: No -regions specified, using default region %s for account %s", defaultRegion, accountName)
+		}
+
+		for _, region := range regionsForAccount {
+			wg.Add(1)
+			accName := accountName
+			reg := region
+			go saws.ProcessSsmCommandOnAccountRegion(ctx, &wg, baseCfgAWS, appConfig, accName, roleCmd, command, reg, instanceID, &successfulExecutions, &totalExecutions)
+		}
+	}
+	wg.Wait()
+	totalDuration := time.Since(startTime)
+
+	finalSuccessCount := successfulExecutions.Load()
+	finalTotalCount := totalExecutions.Load()
+	pkg.LogVerbosef("SSM Cmd Mode: Finished %d total instance executions in %s.", finalTotalCount, totalDuration.Round(time.Second))
+	if finalSuccessCount == finalTotalCount {
+		pkg.LogVerbosef("SSM Cmd Mode: All %d instance executions completed successfully.", finalSuccessCount)
+		os.Exit(0)
+	} else {
+		fmt.Fprintf(os.Stderr, "SSM Cmd Mode: %d out of %d targeted instance executions completed successfully. %d failed.\n", finalSuccessCount, finalTotalCount, finalTotalCount-finalSuccessCount)
+		os.Exit(1)
 	}
 }
