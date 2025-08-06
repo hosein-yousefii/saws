@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"saws/internal/pkg"
@@ -183,7 +185,24 @@ func HandleSSMSession(ctx context.Context, instanceIDFromFlag, accountSelectorFl
 	ssmCmd.Stdin = os.Stdin
 	ssmCmd.Stdout = os.Stdout
 	ssmCmd.Stderr = os.Stderr
+
+	// Set up a channel to handle signals
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGQUIT)
+
+	go func() {
+		for sig := range sigChan {
+			if ssmCmd.Process != nil {
+				pkg.LogVerbosef("Forwarding signal: %v to SSM process", sig)
+				ssmCmd.Process.Signal(sig)
+			}
+		}
+	}()
+
 	err = ssmCmd.Run()
+	signal.Stop(sigChan)
+	close(sigChan)
+
 	pkg.LogVerbosef("SSM session ended.")
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
